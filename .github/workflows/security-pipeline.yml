@@ -1,0 +1,111 @@
+# Security pipeline demo for a fork of OWASP Juice Shop
+# Save as: .github/workflows/security-pipeline.yml in your fork
+# Findings appear under the repo's Security > Code scanning tab.
+# Juice Shop is intentionally vulnerable, so every stage SHOULD report findings.
+
+name: security-pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # upload SARIF to code scanning
+
+jobs:
+  # 1. Secrets scan
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 2a. SAST - Semgrep
+  semgrep:
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep scan --config p/owasp-top-ten --config p/javascript --sarif --output semgrep.sarif || true
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # 2b. SAST - CodeQL
+  codeql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql
+
+  # 3. Dependencies (SCA) + secrets/misconfig in repo files
+  trivy-fs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # 4. Container image scan
+  trivy-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: bkimminich/juice-shop:latest
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  # 5. DAST - ZAP baseline against a running instance
+  zap:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # ZAP action files an issue with the report
+    services:
+      juice:
+        image: bkimminich/juice-shop:latest
+        ports:
+          - 3000:3000
+    steps:
+      - name: Wait for app
+        run: |
+          for i in $(seq 1 30); do curl -fs http://localhost:3000 && exit 0; sleep 5; done; exit 1
+      - uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://localhost:3000
+          fail_action: false
+          allow_issue_writing: true
+
+  # 6 & 7 (AI review + human review) happen on the pull request:
+  #   - Run Claude Code's /security-review on the PR diff in a fresh session
+  #   - Optionally paste the diff into a second vendor's model for a cross-check
+  #   - Protect the branch: require these checks + 1 human approval before merge
